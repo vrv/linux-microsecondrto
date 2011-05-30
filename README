@@ -1,0 +1,67 @@
+Linux TCP microsecond timers patch
+Author: Vijay Vasudevan <vrv@cs.cmu.edu>
+
+This patch enables high-resolution TCP retransmissions.  It replaces
+the existing coarse-grained timers (using the jiffy timer) with
+microsecond-graunlarity timers using the high-resolution timer
+infrastructure.
+
+Background: This patch was developed to help mitigate the "incast"
+problem for wide-fan-in, synchronized communication in datacenters.
+See http://www.pdl.cmu.edu/Incast/ for details.  Our solution required
+retransmissions to fire on the timescale of latencies in a datacenter
+(i.e., microseconds).  This patch enables machines with
+high-resolution timer capabilities to retransmit quickly on packet
+loss.  Keep in mind that the retransmission timeout is always
+calculated using the flow latency, so wide-area communication should
+still have timeouts in the tens to hundreds of milliseconds using this
+patch.
+
+This patch has only been tested in local clusters and on a few
+externally facing machines, but needs much larger-scale testing before
+further adoption.  This repository contains two versions of the patch,
+one for Linux 2.6.28.10 and one for 2.6.39.  The 2.6.28.10 patch has
+been tested in real-world clusters, whereas the 2.6.39 patch compiles
+but has not been tested and may contain bugs (maintaining a separate
+patch across 2 years of independent kernel development is tough!)
+
+This patch requires that the kernel config options HIGH_RES_TIMERS and
+TCP_HIGH_RES_TIMERS are enabled.
+
+The TCP timeout defaults are unchanged on boot (e.g., 200ms minimum
+TCP RTO), so you will have to execute the following sysctl commands to
+change them.
+
+sysctl -w net.ipv4.tcp_rto_min=X
+  sets the minimum retransmission timeout to X microseconds. (Default 200000)
+
+sysctl -w net.ipv4.tcp_delack_min=X
+  sets the minimum delayed ACK timeout to X microseconds. (Default 40000)
+
+sysctl -w net.ipv4.tcp_delayed_ack=0
+  "disables" the delayed ACK mechanism. (=1 enables). (Default 1)
+
+Notes:
+
+1) This patch has not been tested, nor does it compile, with
+   TCP congestion control options such as cubic, bicubic, lp, etc.
+   Modifying these congestion control implementations should be
+   somewhat straightforward if based off the changes from the default
+   implementation.  Volunteers to implement/test are encouraged.
+
+2) An alternative to this patch is to simply reduce TCP_RTO_MIN in
+   tcp.h to 1.  However, this provides no less than 5ms
+   retransmissions because the existing timer infrastructure is tied
+   to HZ, which does not increase above 1000 in most configurations.
+   However, this is a simple one-line change.  Note that this may have
+   strange interactions with delayed ACK unless you use the patch
+   above to disable delayed ACK.  See
+   http://www.pdl.cmu.edu/PDL-FTP/Storage/sigcomm147-vasudevan.pdf for
+   details.
+
+3) Please read up on the incast problem using the links above to
+   understand when this patch is applicable.
+
+Please email me if you have trouble and let me know what kernel
+version and the errors you are receiving.  Pull requests to fix bugs
+or add functionality are greatly appreciated!

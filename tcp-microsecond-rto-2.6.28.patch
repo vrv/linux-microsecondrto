@@ -1,0 +1,1043 @@
+diff -Naur linux-2.6.28.10/include/linux/sysctl.h linux-2.6.28.10-hrttcp/include/linux/sysctl.h
+--- linux-2.6.28.10/include/linux/sysctl.h	2009-05-02 14:54:43.000000000 -0400
++++ linux-2.6.28.10-hrttcp/include/linux/sysctl.h	2009-09-17 10:44:18.000000000 -0400
+@@ -435,6 +435,9 @@
+ 	NET_TCP_ALLOWED_CONG_CONTROL=123,
+ 	NET_TCP_MAX_SSTHRESH=124,
+ 	NET_TCP_FRTO_RESPONSE=125,
++	NET_TCP_RTO_MIN=126,
++	NET_TCP_DELACK_MIN=127,
++	NET_TCP_DELAYED_ACK=128,
+ };
+ 
+ enum {
+diff -Naur linux-2.6.28.10/include/net/dst.h linux-2.6.28.10-hrttcp/include/net/dst.h
+--- linux-2.6.28.10/include/net/dst.h	2009-05-02 14:54:43.000000000 -0400
++++ linux-2.6.28.10-hrttcp/include/net/dst.h	2009-09-17 10:44:18.000000000 -0400
+@@ -131,13 +131,21 @@
+ /* RTT metrics are stored in milliseconds for user ABI, but used as jiffies */
+ static inline unsigned long dst_metric_rtt(const struct dst_entry *dst, int metric)
+ {
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++	return dst_metric(dst, metric) * USEC_PER_MSEC;
++#else
+ 	return msecs_to_jiffies(dst_metric(dst, metric));
++#endif
+ }
+ 
+ static inline void set_dst_metric_rtt(struct dst_entry *dst, int metric,
+ 				      unsigned long rtt)
+ {
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++	dst->metrics[metric-1] = rtt / USEC_PER_MSEC;
++#else
+ 	dst->metrics[metric-1] = jiffies_to_msecs(rtt);
++#endif
+ }
+ 
+ static inline u32
+diff -Naur linux-2.6.28.10/include/net/inet_connection_sock.h linux-2.6.28.10-hrttcp/include/net/inet_connection_sock.h
+--- linux-2.6.28.10/include/net/inet_connection_sock.h	2009-05-02 14:54:43.000000000 -0400
++++ linux-2.6.28.10-hrttcp/include/net/inet_connection_sock.h	2009-09-17 10:44:18.000000000 -0400
+@@ -18,6 +18,10 @@
+ #include <linux/compiler.h>
+ #include <linux/string.h>
+ #include <linux/timer.h>
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++#include <linux/hrtimer.h>
++#include <linux/ktime.h>
++#endif
+ #include <linux/poll.h>
+ 
+ #include <net/inet_sock.h>
+@@ -89,9 +93,17 @@
+ 	struct inet_sock	  icsk_inet;
+ 	struct request_sock_queue icsk_accept_queue;
+ 	struct inet_bind_bucket	  *icsk_bind_hash;
+-	unsigned long		  icsk_timeout;
+- 	struct timer_list	  icsk_retransmit_timer;
+- 	struct timer_list	  icsk_delack_timer;
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++	ktime_t                   icsk_timeout;
++	struct hrtimer		  icsk_retransmit_timer;
++	void			  (*icsk_retransmit_handler)(unsigned long);
++	struct hrtimer		  icsk_delack_timer;
++	void			  (*icsk_delack_handler)(unsigned long);
++#else
++	unsigned long		  icsk_timeout;	
++	struct timer_list	  icsk_retransmit_timer;
++	struct timer_list	  icsk_delack_timer;
++#endif
+ 	__u32			  icsk_rto;
+ 	__u32			  icsk_pmtu_cookie;
+ 	const struct tcp_congestion_ops *icsk_ca_ops;
+@@ -109,9 +121,15 @@
+ 		__u8		  quick;	 /* Scheduled number of quick acks	   */
+ 		__u8		  pingpong;	 /* The session is interactive		   */
+ 		__u8		  blocked;	 /* Delayed ACK was blocked by socket lock */
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++		ktime_t		  ato;		 /* Predicted tick of soft clock	   */
++		ktime_t		  timeout;	 /* Currently scheduled timeout		   */
++		ktime_t		  lrcvtime;	 /* timestamp of last received data packet */
++#else
+ 		__u32		  ato;		 /* Predicted tick of soft clock	   */
+ 		unsigned long	  timeout;	 /* Currently scheduled timeout		   */
+ 		__u32		  lrcvtime;	 /* timestamp of last received data packet */
++#endif
+ 		__u16		  last_seg_size; /* Size of last incoming segment	   */
+ 		__u16		  rcv_mss;	 /* MSS used for delayed ACK decisions	   */ 
+ 	} icsk_ack;
+@@ -190,13 +208,23 @@
+ 	if (what == ICSK_TIME_RETRANS || what == ICSK_TIME_PROBE0) {
+ 		icsk->icsk_pending = 0;
+ #ifdef INET_CSK_CLEAR_TIMERS
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++		if (hrtimer_try_to_cancel(&icsk->icsk_retransmit_timer) == 1)
++			__sock_put(sk);
++#else
+ 		sk_stop_timer(sk, &icsk->icsk_retransmit_timer);
+ #endif
++#endif
+ 	} else if (what == ICSK_TIME_DACK) {
+ 		icsk->icsk_ack.blocked = icsk->icsk_ack.pending = 0;
+ #ifdef INET_CSK_CLEAR_TIMERS
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++		if (hrtimer_try_to_cancel(&icsk->icsk_delack_timer) == 1)
++			__sock_put(sk);
++#else
+ 		sk_stop_timer(sk, &icsk->icsk_delack_timer);
+ #endif
++#endif
+ 	}
+ #ifdef INET_CSK_DEBUG
+ 	else {
+@@ -224,12 +252,28 @@
+ 
+ 	if (what == ICSK_TIME_RETRANS || what == ICSK_TIME_PROBE0) {
+ 		icsk->icsk_pending = what;
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++		icsk->icsk_timeout = ktime_add_us(ktime_get(), when);
++		if (!hrtimer_start(&icsk->icsk_retransmit_timer,
++				   icsk->icsk_timeout,
++				   HRTIMER_MODE_ABS))
++			sock_hold(sk);
++#else
+ 		icsk->icsk_timeout = jiffies + when;
+ 		sk_reset_timer(sk, &icsk->icsk_retransmit_timer, icsk->icsk_timeout);
++#endif
+ 	} else if (what == ICSK_TIME_DACK) {
+ 		icsk->icsk_ack.pending |= ICSK_ACK_TIMER;
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++		icsk->icsk_ack.timeout = ktime_add_us(ktime_get(), when);
++		if (!hrtimer_start(&icsk->icsk_delack_timer,
++				   icsk->icsk_ack.timeout,
++				   HRTIMER_MODE_ABS))
++			sock_hold(sk);
++#else
+ 		icsk->icsk_ack.timeout = jiffies + when;
+ 		sk_reset_timer(sk, &icsk->icsk_delack_timer, icsk->icsk_ack.timeout);
++#endif
+ 	}
+ #ifdef INET_CSK_DEBUG
+ 	else {
+diff -Naur linux-2.6.28.10/include/net/tcp.h linux-2.6.28.10-hrttcp/include/net/tcp.h
+--- linux-2.6.28.10/include/net/tcp.h	2009-05-02 14:54:43.000000000 -0400
++++ linux-2.6.28.10-hrttcp/include/net/tcp.h	2009-09-17 10:55:24.000000000 -0400
+@@ -116,6 +116,21 @@
+ 				  * TIME-WAIT timer.
+ 				  */
+ 
++
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++#define TCP_DELACK_MAX	TCP_RTO_MAX             /* maximal time to delay before sending an ACK */
++#define TCP_DELACK_MIN	((unsigned)40*USEC_PER_MSEC)
++                                                /* minimal time to delay before sending an ACK */
++#define TCP_ATO_MIN	(ktime_set(0,200*NSEC_PER_USEC))
++#define TCP_RTO_MAX     ((unsigned)120*USEC_PER_SEC)
++#define TCP_RTO_MIN     ((unsigned)200*USEC_PER_MSEC)
++#define TCP_TIMEOUT_INIT ((unsigned)3*USEC_PER_SEC)
++                                                /* RFC 1122 initial RTO value */
++#define TCP_RESOURCE_PROBE_INTERVAL ((unsigned)500*USEC_PER_MSEC)
++                                                /* Maximal interval between probes
++                                                 * for local resources.
++                                                 */
++#else
+ #define TCP_DELACK_MAX	((unsigned)(HZ/5))	/* maximal time to delay before sending an ACK */
+ #if HZ >= 100
+ #define TCP_DELACK_MIN	((unsigned)(HZ/25))	/* minimal time to delay before sending an ACK */
+@@ -131,6 +146,7 @@
+ #define TCP_RESOURCE_PROBE_INTERVAL ((unsigned)(HZ/2U)) /* Maximal interval between probes
+ 					                 * for local resources.
+ 					                 */
++#endif /* CONFIG_TCP_HIGH_RES_TIMERS */
+ 
+ #define TCP_KEEPALIVE_TIME	(120*60*HZ)	/* two hours */
+ #define TCP_KEEPALIVE_PROBES	9		/* Max of 9 keepalive probes	*/
+@@ -236,6 +252,11 @@
+ extern int sysctl_tcp_workaround_signed_windows;
+ extern int sysctl_tcp_slow_start_after_idle;
+ extern int sysctl_tcp_max_ssthresh;
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++extern int sysctl_tcp_rto_min;
++extern int sysctl_tcp_delack_min;
++#endif
++extern int sysctl_tcp_delayed_ack;
+ 
+ extern atomic_t tcp_memory_allocated;
+ extern atomic_t tcp_sockets_allocated;
+@@ -548,7 +569,11 @@
+  * to use only the low 32-bits of jiffies and hide the ugly
+  * casts with the following macro.
+  */
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++#define tcp_time_stamp		((__u32)(ktime_to_ns(ktime_get()) >> 10))
++#else
+ #define tcp_time_stamp		((__u32)(jiffies))
++#endif
+ 
+ /* This is what the send packet queuing engine uses to pass
+  * TCP per-packet control information to the transmission
+@@ -1032,8 +1057,13 @@
+ {
+ 	/* See RFC 2012 */
+ 	TCP_ADD_STATS_USER(net, TCP_MIB_RTOALGORITHM, 1);
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++	TCP_ADD_STATS_USER(net, TCP_MIB_RTOMIN, TCP_RTO_MIN/1000);
++	TCP_ADD_STATS_USER(net, TCP_MIB_RTOMAX, TCP_RTO_MAX/1000);
++#else
+ 	TCP_ADD_STATS_USER(net, TCP_MIB_RTOMIN, TCP_RTO_MIN*1000/HZ);
+ 	TCP_ADD_STATS_USER(net, TCP_MIB_RTOMAX, TCP_RTO_MAX*1000/HZ);
++#endif
+ 	TCP_ADD_STATS_USER(net, TCP_MIB_MAXCONN, -1);
+ }
+ 
+diff -Naur linux-2.6.28.10/kernel/sysctl_check.c linux-2.6.28.10-hrttcp/kernel/sysctl_check.c
+--- linux-2.6.28.10/kernel/sysctl_check.c	2009-05-02 14:54:43.000000000 -0400
++++ linux-2.6.28.10-hrttcp/kernel/sysctl_check.c	2009-09-17 10:44:18.000000000 -0400
+@@ -353,6 +353,9 @@
+ 	{ NET_TCP_FACK,				"tcp_fack" },
+ 	{ NET_TCP_REORDERING,			"tcp_reordering" },
+ 	{ NET_TCP_ECN,				"tcp_ecn" },
++	{ NET_TCP_RTO_MIN,			"tcp_rto_min" },
++	{ NET_TCP_DELACK_MIN,			"tcp_delack_min" },
++	{ NET_TCP_DELAYED_ACK,			"tcp_delayed_ack" },
+ 	{ NET_TCP_DSACK,			"tcp_dsack" },
+ 	{ NET_TCP_MEM,				"tcp_mem" },
+ 	{ NET_TCP_WMEM,				"tcp_wmem" },
+diff -Naur linux-2.6.28.10/net/dccp/ccids/ccid3.c linux-2.6.28.10-hrttcp/net/dccp/ccids/ccid3.c
+--- linux-2.6.28.10/net/dccp/ccids/ccid3.c	2009-05-02 14:54:43.000000000 -0400
++++ linux-2.6.28.10-hrttcp/net/dccp/ccids/ccid3.c	2009-09-17 10:44:18.000000000 -0400
+@@ -323,9 +323,15 @@
+ 		 * to RFC 4342. This implements the initialisation procedure of
+ 		 * draft rfc3448bis, section 4.2. Remember, X is scaled by 2^6.
+ 		 */
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++		if (ktime_equal(dp->dccps_syn_rtt, ktime_set(0,0))) {
++			ccid3_pr_debug("SYN RTT = %uus\n", usecs_to_jiffies((u32)ktime_to_us(dp->dccps_syn_rtt)));
++			hctx->ccid3hctx_rtt  = usecs_to_jiffies((u32)ktime_to_us(dp->dccps_syn_rtt));
++#else
+ 		if (dp->dccps_syn_rtt) {
+ 			ccid3_pr_debug("SYN RTT = %uus\n", dp->dccps_syn_rtt);
+ 			hctx->ccid3hctx_rtt  = dp->dccps_syn_rtt;
++#endif
+ 			hctx->ccid3hctx_x    = rfc3390_initial_rate(sk);
+ 			hctx->ccid3hctx_t_ld = now;
+ 		} else {
+diff -Naur linux-2.6.28.10/net/dccp/input.c linux-2.6.28.10-hrttcp/net/dccp/input.c
+--- linux-2.6.28.10/net/dccp/input.c	2009-05-02 14:54:43.000000000 -0400
++++ linux-2.6.28.10-hrttcp/net/dccp/input.c	2009-09-17 10:44:18.000000000 -0400
+@@ -426,8 +426,14 @@
+ 
+ 		/* Obtain usec RTT sample from SYN exchange (used by CCID 3) */
+ 		if (likely(dp->dccps_options_received.dccpor_timestamp_echo))
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++			dp->dccps_syn_rtt = ktime_add_us(ktime_set(0,0),
++			  dccp_sample_rtt(sk, 10 * (tstamp -
++			    dp->dccps_options_received.dccpor_timestamp_echo)));
++#else
+ 			dp->dccps_syn_rtt = dccp_sample_rtt(sk, 10 * (tstamp -
+ 			    dp->dccps_options_received.dccpor_timestamp_echo));
++#endif
+ 
+ 		if (dccp_msk(sk)->dccpms_send_ack_vector &&
+ 		    dccp_ackvec_add(dp->dccps_hc_rx_ackvec, sk,
+diff -Naur linux-2.6.28.10/net/dccp/output.c linux-2.6.28.10-hrttcp/net/dccp/output.c
+--- linux-2.6.28.10/net/dccp/output.c	2009-05-02 14:54:43.000000000 -0400
++++ linux-2.6.28.10-hrttcp/net/dccp/output.c	2009-09-17 10:44:18.000000000 -0400
+@@ -502,9 +502,15 @@
+ 		if (skb == NULL) {
+ 			inet_csk_schedule_ack(sk);
+ 			inet_csk(sk)->icsk_ack.ato = TCP_ATO_MIN;
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++			inet_csk_reset_xmit_timer(sk, ICSK_TIME_DACK,
++						  TCP_DELACK_MAX,
++						  jiffies_to_usecs(DCCP_RTO_MAX));
++#else
+ 			inet_csk_reset_xmit_timer(sk, ICSK_TIME_DACK,
+ 						  TCP_DELACK_MAX,
+ 						  DCCP_RTO_MAX);
++#endif
+ 			return;
+ 		}
+ 
+@@ -527,7 +533,11 @@
+ 	 * with using 2s, and active senders also piggyback the ACK into a
+ 	 * DATAACK packet, so this is really for quiescent senders.
+ 	 */
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++	ktime_t timeout = ktime_add_us(ktime_get(), 2 * USEC_PER_SEC);
++#else
+ 	unsigned long timeout = jiffies + 2 * HZ;
++#endif
+ 
+ 	/* Use new timeout only if there wasn't a older one earlier. */
+ 	if (icsk->icsk_ack.pending & ICSK_ACK_TIMER) {
+@@ -541,12 +551,21 @@
+ 			return;
+ 		}
+ 
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++		if (ktime_to_ns(ktime_sub(timeout, icsk->icsk_ack.timeout)) >= 0)
++#else
+ 		if (!time_before(timeout, icsk->icsk_ack.timeout))
++#endif
+ 			timeout = icsk->icsk_ack.timeout;
+ 	}
+ 	icsk->icsk_ack.pending |= ICSK_ACK_SCHED | ICSK_ACK_TIMER;
+ 	icsk->icsk_ack.timeout = timeout;
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++	if (!hrtimer_start(&icsk->icsk_delack_timer, timeout, HRTIMER_MODE_ABS))
++		sock_hold(sk);
++#else
+ 	sk_reset_timer(sk, &icsk->icsk_delack_timer, timeout);
++#endif
+ }
+ #endif
+ 
+diff -Naur linux-2.6.28.10/net/dccp/timer.c linux-2.6.28.10-hrttcp/net/dccp/timer.c
+--- linux-2.6.28.10/net/dccp/timer.c	2009-05-02 14:54:43.000000000 -0400
++++ linux-2.6.28.10-hrttcp/net/dccp/timer.c	2009-09-17 10:44:18.000000000 -0400
+@@ -121,7 +121,7 @@
+ 			icsk->icsk_retransmits = 1;
+ 		inet_csk_reset_xmit_timer(sk, ICSK_TIME_RETRANS,
+ 					  min(icsk->icsk_rto,
+-					      TCP_RESOURCE_PROBE_INTERVAL),
++					      (__u32)TCP_RESOURCE_PROBE_INTERVAL),
+ 					  DCCP_RTO_MAX);
+ 		return;
+ 	}
+@@ -144,18 +144,33 @@
+ 
+ 	bh_lock_sock(sk);
+ 	if (sock_owned_by_user(sk)) {
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++		if (!hrtimer_start(&icsk->icsk_retransmit_timer,
++				   ktime_add_us(ktime_get(), TCP_RTO_MIN),
++				   HRTIMER_MODE_ABS))
++			sock_hold(sk);
++#else
+ 		/* Try again later */
+ 		sk_reset_timer(sk, &icsk->icsk_retransmit_timer,
+ 			       jiffies + (HZ / 20));
++#endif
+ 		goto out;
+ 	}
+ 
+ 	if (sk->sk_state == DCCP_CLOSED || !icsk->icsk_pending)
+ 		goto out;
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++	if (ktime_us_delta(icsk->icsk_timeout, ktime_get()) > 0) {
++		if (!hrtimer_start(&icsk->icsk_retransmit_timer,
++				   icsk->icsk_timeout,
++				   HRTIMER_MODE_ABS))
++			sock_hold(sk);
+ 
++#else
+ 	if (time_after(icsk->icsk_timeout, jiffies)) {
+ 		sk_reset_timer(sk, &icsk->icsk_retransmit_timer,
+ 			       icsk->icsk_timeout);
++#endif
+ 		goto out;
+ 	}
+ 
+@@ -213,17 +228,32 @@
+ 		/* Try again later. */
+ 		icsk->icsk_ack.blocked = 1;
+ 		NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_DELAYEDACKLOCKED);
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++		if (!hrtimer_start(&icsk->icsk_delack_timer,
++				   ktime_add_us(ktime_get(), TCP_DELACK_MIN),
++				   HRTIMER_MODE_ABS))
++			sock_hold(sk);
++#else
+ 		sk_reset_timer(sk, &icsk->icsk_delack_timer,
+ 			       jiffies + TCP_DELACK_MIN);
++#endif
+ 		goto out;
+ 	}
+ 
+ 	if (sk->sk_state == DCCP_CLOSED ||
+ 	    !(icsk->icsk_ack.pending & ICSK_ACK_TIMER))
+ 		goto out;
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++	if (ktime_us_delta(icsk->icsk_ack.timeout, ktime_get()) > 0) {
++		if (!hrtimer_start(&icsk->icsk_delack_timer,
++				   icsk->icsk_ack.timeout,
++				   HRTIMER_MODE_ABS))
++			sock_hold(sk);
++#else
+ 	if (time_after(icsk->icsk_ack.timeout, jiffies)) {
+ 		sk_reset_timer(sk, &icsk->icsk_delack_timer,
+ 			       icsk->icsk_ack.timeout);
++#endif
+ 		goto out;
+ 	}
+ 
+@@ -232,8 +262,15 @@
+ 	if (inet_csk_ack_scheduled(sk)) {
+ 		if (!icsk->icsk_ack.pingpong) {
+ 			/* Delayed ACK missed: inflate ATO. */
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++			icsk->icsk_ack.ato =
++				ns_to_ktime(NSEC_PER_USEC*
++					    min((u32)ktime_to_us(icsk->icsk_ack.ato) << 1,
++						(u32)jiffies_to_usecs(icsk->icsk_rto)));
++#else
+ 			icsk->icsk_ack.ato = min(icsk->icsk_ack.ato << 1,
+ 						 icsk->icsk_rto);
++#endif
+ 		} else {
+ 			/* Delayed ACK missed: leave pingpong mode and
+ 			 * deflate ATO.
+diff -Naur linux-2.6.28.10/net/ipv4/inet_connection_sock.c linux-2.6.28.10-hrttcp/net/ipv4/inet_connection_sock.c
+--- linux-2.6.28.10/net/ipv4/inet_connection_sock.c	2009-05-02 14:54:43.000000000 -0400
++++ linux-2.6.28.10-hrttcp/net/ipv4/inet_connection_sock.c	2009-09-17 10:44:18.000000000 -0400
+@@ -274,6 +274,23 @@
+ 
+ EXPORT_SYMBOL(inet_csk_accept);
+ 
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++static enum hrtimer_restart retransmit_callback(struct hrtimer *timer)
++{
++	struct inet_connection_sock *icsk = container_of(timer, struct inet_connection_sock, icsk_retransmit_timer);
++	//printk(KERN_DEBUG "TCP_HRTIMER %s(%d): rto %u delta %d\n", __FILE__, __LINE__, (u32)ktime_to_us(icsk->icsk_timeout), (u32)ktime_us_delta(icsk->icsk_timeout, ktime_get()));
++	icsk->icsk_retransmit_handler((unsigned long)icsk);
++	return HRTIMER_NORESTART;
++}
++
++static enum hrtimer_restart delack_callback(struct hrtimer *timer)
++{
++	struct inet_connection_sock *icsk = container_of(timer, struct inet_connection_sock, icsk_delack_timer);	
++	icsk->icsk_delack_handler((unsigned long)icsk);
++	return HRTIMER_NORESTART;
++}
++#endif
++
+ /*
+  * Using different timers for retransmit, delayed acks and probes
+  * We may wish use just one timer maintaining a list of expire jiffies
+@@ -285,11 +302,20 @@
+ 			       void (*keepalive_handler)(unsigned long))
+ {
+ 	struct inet_connection_sock *icsk = inet_csk(sk);
+-
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++	hrtimer_init(&icsk->icsk_retransmit_timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
++	hrtimer_init(&icsk->icsk_delack_timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
++	
++	icsk->icsk_retransmit_handler = retransmit_handler;
++	icsk->icsk_retransmit_timer.function = retransmit_callback;
++	icsk->icsk_delack_handler = delack_handler;
++	icsk->icsk_delack_timer.function = delack_callback;
++#else
+ 	setup_timer(&icsk->icsk_retransmit_timer, retransmit_handler,
+ 			(unsigned long)sk);
+ 	setup_timer(&icsk->icsk_delack_timer, delack_handler,
+ 			(unsigned long)sk);
++#endif
+ 	setup_timer(&sk->sk_timer, keepalive_handler, (unsigned long)sk);
+ 	icsk->icsk_pending = icsk->icsk_ack.pending = 0;
+ }
+@@ -302,8 +328,15 @@
+ 
+ 	icsk->icsk_pending = icsk->icsk_ack.pending = icsk->icsk_ack.blocked = 0;
+ 
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++	if (hrtimer_try_to_cancel(&icsk->icsk_retransmit_timer) == 1)
++		__sock_put(sk);
++	if (hrtimer_try_to_cancel(&icsk->icsk_delack_timer) == 1)
++		__sock_put(sk);
++#else
+ 	sk_stop_timer(sk, &icsk->icsk_retransmit_timer);
+ 	sk_stop_timer(sk, &icsk->icsk_delack_timer);
++#endif
+ 	sk_stop_timer(sk, &sk->sk_timer);
+ }
+ 
+diff -Naur linux-2.6.28.10/net/ipv4/inet_diag.c linux-2.6.28.10-hrttcp/net/ipv4/inet_diag.c
+--- linux-2.6.28.10/net/ipv4/inet_diag.c	2009-05-02 14:54:43.000000000 -0400
++++ linux-2.6.28.10-hrttcp/net/ipv4/inet_diag.c	2009-09-17 10:44:18.000000000 -0400
+@@ -137,11 +137,19 @@
+ 	if (icsk->icsk_pending == ICSK_TIME_RETRANS) {
+ 		r->idiag_timer = 1;
+ 		r->idiag_retrans = icsk->icsk_retransmits;
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++	        r->idiag_expires = ktime_to_ns(ktime_sub(icsk->icsk_timeout, ktime_get())) >> 20; 
++#else
+ 		r->idiag_expires = EXPIRES_IN_MS(icsk->icsk_timeout);
++#endif
+ 	} else if (icsk->icsk_pending == ICSK_TIME_PROBE0) {
+ 		r->idiag_timer = 4;
+ 		r->idiag_retrans = icsk->icsk_probes_out;
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++	        r->idiag_expires = ktime_to_ns(ktime_sub(icsk->icsk_timeout, ktime_get())) >> 20; 
++#else
+ 		r->idiag_expires = EXPIRES_IN_MS(icsk->icsk_timeout);
++#endif
+ 	} else if (timer_pending(&sk->sk_timer)) {
+ 		r->idiag_timer = 2;
+ 		r->idiag_retrans = icsk->icsk_probes_out;
+diff -Naur linux-2.6.28.10/net/ipv4/Kconfig linux-2.6.28.10-hrttcp/net/ipv4/Kconfig
+--- linux-2.6.28.10/net/ipv4/Kconfig	2009-05-02 14:54:43.000000000 -0400
++++ linux-2.6.28.10-hrttcp/net/ipv4/Kconfig	2009-09-17 10:44:18.000000000 -0400
+@@ -422,6 +422,16 @@
+ 	depends on INET_DIAG
+ 	def_tristate INET_DIAG
+ 
++config TCP_HIGH_RES_TIMERS
++        bool "High resolution retransmission support"
++        depends on HIGH_RES_TIMERS
++        default n
++        ---help---
++          Users hrtimer for TCP retransmissions and delayed
++          ack for experimental purposes
++
++          If unsure, say N
++
+ menuconfig TCP_CONG_ADVANCED
+ 	bool "TCP: advanced congestion control"
+ 	---help---
+diff -Naur linux-2.6.28.10/net/ipv4/sysctl_net_ipv4.c linux-2.6.28.10-hrttcp/net/ipv4/sysctl_net_ipv4.c
+--- linux-2.6.28.10/net/ipv4/sysctl_net_ipv4.c	2009-05-02 14:54:43.000000000 -0400
++++ linux-2.6.28.10-hrttcp/net/ipv4/sysctl_net_ipv4.c	2009-09-17 10:44:18.000000000 -0400
+@@ -494,6 +494,32 @@
+ 		.mode		= 0644,
+ 		.proc_handler	= &proc_dointvec
+ 	},
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++	{
++		.ctl_name	= NET_TCP_RTO_MIN,
++		.procname	= "tcp_rto_min",
++		.data		= &sysctl_tcp_rto_min,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= &proc_dointvec
++	},
++	{
++		.ctl_name	= NET_TCP_DELACK_MIN,
++		.procname	= "tcp_delack_min",
++		.data		= &sysctl_tcp_delack_min,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= &proc_dointvec
++	},
++#endif
++	{
++		.ctl_name	= NET_TCP_DELAYED_ACK,
++		.procname	= "tcp_delayed_ack",
++		.data		= &sysctl_tcp_delayed_ack,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= &proc_dointvec
++	},
+ 	{
+ 		.ctl_name	= NET_TCP_DSACK,
+ 		.procname	= "tcp_dsack",
+diff -Naur linux-2.6.28.10/net/ipv4/tcp.c linux-2.6.28.10-hrttcp/net/ipv4/tcp.c
+--- linux-2.6.28.10/net/ipv4/tcp.c	2009-05-02 14:54:43.000000000 -0400
++++ linux-2.6.28.10-hrttcp/net/ipv4/tcp.c	2009-09-17 10:44:18.000000000 -0400
+@@ -2232,7 +2232,11 @@
+ 		info->tcpi_options |= TCPI_OPT_ECN;
+ 
+ 	info->tcpi_rto = jiffies_to_usecs(icsk->icsk_rto);
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++	info->tcpi_ato = (__u32)ktime_to_us(icsk->icsk_ack.ato);
++#else
+ 	info->tcpi_ato = jiffies_to_usecs(icsk->icsk_ack.ato);
++#endif
+ 	info->tcpi_snd_mss = tp->mss_cache;
+ 	info->tcpi_rcv_mss = icsk->icsk_ack.rcv_mss;
+ 
+@@ -2248,7 +2252,11 @@
+ 	info->tcpi_fackets = tp->fackets_out;
+ 
+ 	info->tcpi_last_data_sent = jiffies_to_msecs(now - tp->lsndtime);
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++	info->tcpi_last_data_recv = ((u32)ktime_us_delta(ktime_get(), icsk->icsk_ack.lrcvtime) / USEC_PER_MSEC);
++#else
+ 	info->tcpi_last_data_recv = jiffies_to_msecs(now - icsk->icsk_ack.lrcvtime);
++#endif
+ 	info->tcpi_last_ack_recv = jiffies_to_msecs(now - tp->rcv_tstamp);
+ 
+ 	info->tcpi_pmtu = icsk->icsk_pmtu_cookie;
+diff -Naur linux-2.6.28.10/net/ipv4/tcp_input.c linux-2.6.28.10-hrttcp/net/ipv4/tcp_input.c
+--- linux-2.6.28.10/net/ipv4/tcp_input.c	2009-05-02 14:54:43.000000000 -0400
++++ linux-2.6.28.10-hrttcp/net/ipv4/tcp_input.c	2009-09-17 10:44:18.000000000 -0400
+@@ -77,6 +77,10 @@
+ int sysctl_tcp_fack __read_mostly = 1;
+ int sysctl_tcp_reordering __read_mostly = TCP_FASTRETRANS_THRESH;
+ int sysctl_tcp_ecn __read_mostly;
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++int sysctl_tcp_rto_min __read_mostly = TCP_RTO_MIN;
++#endif
++int sysctl_tcp_delayed_ack __read_mostly = 1;
+ int sysctl_tcp_dsack __read_mostly = 1;
+ int sysctl_tcp_app_win __read_mostly = 31;
+ int sysctl_tcp_adv_win_scale __read_mostly = 2;
+@@ -466,7 +470,7 @@
+ 		goto new_measure;
+ 	if (before(tp->rcv_nxt, tp->rcv_rtt_est.seq))
+ 		return;
+-	tcp_rcv_rtt_update(tp, jiffies - tp->rcv_rtt_est.time, 1);
++	tcp_rcv_rtt_update(tp, tcp_time_stamp - tp->rcv_rtt_est.time, 1);
+ 
+ new_measure:
+ 	tp->rcv_rtt_est.seq = tp->rcv_nxt + tp->rcv_wnd;
+@@ -554,7 +558,11 @@
+ {
+ 	struct tcp_sock *tp = tcp_sk(sk);
+ 	struct inet_connection_sock *icsk = inet_csk(sk);
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++	ktime_t now;
++#else
+ 	u32 now;
++#endif
+ 
+ 	inet_csk_schedule_ack(sk);
+ 
+@@ -562,6 +570,40 @@
+ 
+ 	tcp_rcv_rtt_measure(tp);
+ 
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++	now = ktime_get();
++
++	if (ktime_equal(icsk->icsk_ack.ato, ktime_set(0,0))) {
++		/* The _first_ data packet received, initialize
++		 * delayed ACK engine.
++		 */
++		tcp_incr_quickack(sk);
++		icsk->icsk_ack.ato = TCP_ATO_MIN;
++	} else {
++		ktime_t m = ktime_sub(now, icsk->icsk_ack.lrcvtime);
++		s64 m_ns = ktime_to_ns(m);
++		s64 ato_ns = ktime_to_ns(icsk->icsk_ack.ato);
++		s64 rto_ns = (s64)jiffies_to_usecs(icsk->icsk_rto) * NSEC_PER_USEC;
++		s64 ato_min_ns = ktime_to_ns(TCP_ATO_MIN);
++
++		if (m_ns <= ato_min_ns / 2) {
++			/* The fastest case is the first. */
++			icsk->icsk_ack.ato = ns_to_ktime((ato_ns >> 1) + (ato_min_ns / 2));
++		} else if (m_ns < ato_ns) {
++			icsk->icsk_ack.ato = ktime_add_ns(m, ato_ns >> 1);
++			if (ato_ns > rto_ns)
++				icsk->icsk_ack.ato = ns_to_ktime(rto_ns);
++		} else if (m_ns > rto_ns) {
++			/* Too long gap. Apparently sender failed to
++			 * restart window, so that we send ACKs quickly.
++			 */
++			tcp_incr_quickack(sk);
++			sk_mem_reclaim(sk);
++		}
++	}
++
++	icsk->icsk_ack.lrcvtime = now;
++#else
+ 	now = tcp_time_stamp;
+ 
+ 	if (!icsk->icsk_ack.ato) {
+@@ -589,6 +631,7 @@
+ 		}
+ 	}
+ 	icsk->icsk_ack.lrcvtime = now;
++#endif
+ 
+ 	TCP_ECN_check_ce(tp, skb);
+ 
+@@ -599,8 +642,11 @@
+ static u32 tcp_rto_min(struct sock *sk)
+ {
+ 	struct dst_entry *dst = __sk_dst_get(sk);
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++	u32 rto_min = sysctl_tcp_rto_min;
++#else
+ 	u32 rto_min = TCP_RTO_MIN;
+-
++#endif
+ 	if (dst && dst_metric_locked(dst, RTAX_RTO_MIN))
+ 		rto_min = dst_metric_rtt(dst, RTAX_RTO_MIN);
+ 	return rto_min;
+@@ -2977,7 +3023,11 @@
+ 					rtt_us = ktime_us_delta(ktime_get_real(),
+ 								last_ackt);
+ 				else if (ca_seq_rtt > 0)
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++					rtt_us = ca_seq_rtt;
++#else
+ 					rtt_us = jiffies_to_usecs(ca_seq_rtt);
++#endif
+ 			}
+ 
+ 			ca_ops->pkts_acked(sk, pkts_acked, rtt_us);
+@@ -3025,7 +3075,7 @@
+ 		 */
+ 	} else {
+ 		inet_csk_reset_xmit_timer(sk, ICSK_TIME_PROBE0,
+-					  min(icsk->icsk_rto << icsk->icsk_backoff, TCP_RTO_MAX),
++					  min(icsk->icsk_rto << icsk->icsk_backoff, (__u32)TCP_RTO_MAX),
+ 					  TCP_RTO_MAX);
+ 	}
+ }
+@@ -4504,6 +4554,8 @@
+ 	     && __tcp_select_window(sk) >= tp->rcv_wnd) ||
+ 	    /* We ACK each frame or... */
+ 	    tcp_in_quickack_mode(sk) ||
++	    /* Delayed ACK is disabled or ... */
++	    sysctl_tcp_delayed_ack == 0 ||
+ 	    /* We have out of order data. */
+ 	    (ofo_possible && skb_peek(&tp->out_of_order_queue))) {
+ 		/* Then ack it now */
+@@ -5156,7 +5208,11 @@
+ 			 * to stand against the temptation 8)     --ANK
+ 			 */
+ 			inet_csk_schedule_ack(sk);
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++			icsk->icsk_ack.lrcvtime = ktime_get();
++#else
+ 			icsk->icsk_ack.lrcvtime = tcp_time_stamp;
++#endif
+ 			icsk->icsk_ack.ato	 = TCP_ATO_MIN;
+ 			tcp_incr_quickack(sk);
+ 			tcp_enter_quickack_mode(sk);
+@@ -5485,6 +5541,9 @@
+ }
+ 
+ EXPORT_SYMBOL(sysctl_tcp_ecn);
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++EXPORT_SYMBOL(sysctl_tcp_rto_min);
++#endif
+ EXPORT_SYMBOL(sysctl_tcp_reordering);
+ EXPORT_SYMBOL(sysctl_tcp_adv_win_scale);
+ EXPORT_SYMBOL(tcp_parse_options);
+diff -Naur linux-2.6.28.10/net/ipv4/tcp_ipv4.c linux-2.6.28.10-hrttcp/net/ipv4/tcp_ipv4.c
+--- linux-2.6.28.10/net/ipv4/tcp_ipv4.c	2009-05-02 14:54:43.000000000 -0400
++++ linux-2.6.28.10-hrttcp/net/ipv4/tcp_ipv4.c	2009-09-17 10:44:18.000000000 -0400
+@@ -2225,10 +2225,18 @@
+ 
+ 	if (icsk->icsk_pending == ICSK_TIME_RETRANS) {
+ 		timer_active	= 1;
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++		timer_expires	= usecs_to_jiffies(ktime_to_ns(icsk->icsk_timeout)*NSEC_PER_USEC);
++#else
+ 		timer_expires	= icsk->icsk_timeout;
++#endif
+ 	} else if (icsk->icsk_pending == ICSK_TIME_PROBE0) {
+ 		timer_active	= 4;
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++		timer_expires	= usecs_to_jiffies(ktime_to_ns(icsk->icsk_timeout)*NSEC_PER_USEC);
++#else
+ 		timer_expires	= icsk->icsk_timeout;
++#endif
+ 	} else if (timer_pending(&sk->sk_timer)) {
+ 		timer_active	= 2;
+ 		timer_expires	= sk->sk_timer.expires;
+@@ -2251,7 +2259,11 @@
+ 		sock_i_ino(sk),
+ 		atomic_read(&sk->sk_refcnt), sk,
+ 		jiffies_to_clock_t(icsk->icsk_rto),
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++		(clock_t)div_u64((u64)ktime_to_ns(icsk->icsk_ack.ato), NSEC_PER_SEC / USER_HZ),
++#else
+ 		jiffies_to_clock_t(icsk->icsk_ack.ato),
++#endif
+ 		(icsk->icsk_ack.quick << 1) | icsk->icsk_ack.pingpong,
+ 		tp->snd_cwnd,
+ 		tp->snd_ssthresh >= 0xFFFF ? -1 : tp->snd_ssthresh,
+diff -Naur linux-2.6.28.10/net/ipv4/tcp_output.c linux-2.6.28.10-hrttcp/net/ipv4/tcp_output.c
+--- linux-2.6.28.10/net/ipv4/tcp_output.c	2009-05-02 14:54:43.000000000 -0400
++++ linux-2.6.28.10-hrttcp/net/ipv4/tcp_output.c	2009-09-17 10:44:18.000000000 -0400
+@@ -56,6 +56,10 @@
+ int sysctl_tcp_mtu_probing __read_mostly = 0;
+ int sysctl_tcp_base_mss __read_mostly = 512;
+ 
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++int sysctl_tcp_delack_min __read_mostly = TCP_DELACK_MIN;
++#endif
++
+ /* By default, RFC2861 behavior.  */
+ int sysctl_tcp_slow_start_after_idle __read_mostly = 1;
+ 
+@@ -157,7 +161,12 @@
+ 	/* If it is a reply for ato after last received
+ 	 * packet, enter pingpong mode.
+ 	 */
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++	if (0 < ktime_to_ns(ktime_sub(icsk->icsk_ack.ato,
++				      ktime_sub(ktime_get(), icsk->icsk_ack.lrcvtime))))
++#else
+ 	if ((u32)(now - icsk->icsk_ack.lrcvtime) < icsk->icsk_ack.ato)
++#endif
+ 		icsk->icsk_ack.pingpong = 1;
+ }
+ 
+@@ -2437,6 +2446,58 @@
+ void tcp_send_delayed_ack(struct sock *sk)
+ {
+ 	struct inet_connection_sock *icsk = inet_csk(sk);
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++	u32 ato = (u32)ktime_to_us(icsk->icsk_ack.ato);
++	ktime_t timeout;
++
++	if (ato > sysctl_tcp_delack_min) {
++		const struct tcp_sock *tp = tcp_sk(sk);
++		u32 max_ato = 500*USEC_PER_MSEC;
++
++		if (icsk->icsk_ack.pingpong ||
++		    (icsk->icsk_ack.pending & ICSK_ACK_PUSHED))
++			max_ato = TCP_DELACK_MAX;
++
++		/* Slow path, intersegment interval is "high". */
++
++		/* If some rtt estimate is known, use it to bound delayed ack.
++		 * Do not use inet_csk(sk)->icsk_rto here, use results of rtt measurements
++		 * directly.
++		 */
++		if (tp->srtt) {
++			u32 rtt = max((u32)(tp->srtt >> 3),
++				      (u32)sysctl_tcp_delack_min);
++
++			if (rtt < max_ato)
++				max_ato = rtt;
++		}
++
++		ato = min(ato, max_ato);
++	}
++
++	/* Stay within the limit we were given */
++	timeout = ktime_add_us(ktime_get(), ato);
++
++	/* Use new timeout only if there wasn't a older one earlier. */
++	if (icsk->icsk_ack.pending & ICSK_ACK_TIMER) {
++		/* If delack timer was blocked or is about to expire,
++		 * send ACK now.
++		 */
++		if (icsk->icsk_ack.blocked ||
++		    ktime_to_ns(ktime_sub(ktime_add_us(ktime_get(), ato >> 2),
++					  icsk->icsk_ack.timeout)) >= 0) {
++			tcp_send_ack(sk);
++			return;
++		}
++
++		if (ktime_to_ns(ktime_sub(timeout, icsk->icsk_ack.timeout)) >= 0)
++			timeout = icsk->icsk_ack.timeout;
++	}
++	icsk->icsk_ack.pending |= ICSK_ACK_SCHED | ICSK_ACK_TIMER;
++	icsk->icsk_ack.timeout = timeout;
++	if (!hrtimer_start(&icsk->icsk_delack_timer, timeout, HRTIMER_MODE_ABS))
++		sock_hold(sk);
++#else
+ 	int ato = icsk->icsk_ack.ato;
+ 	unsigned long timeout;
+ 
+@@ -2484,6 +2545,7 @@
+ 	icsk->icsk_ack.pending |= ICSK_ACK_SCHED | ICSK_ACK_TIMER;
+ 	icsk->icsk_ack.timeout = timeout;
+ 	sk_reset_timer(sk, &icsk->icsk_delack_timer, timeout);
++#endif
+ }
+ 
+ /* This routine sends an ack and also updates the window. */
+@@ -2615,7 +2677,7 @@
+ 			icsk->icsk_backoff++;
+ 		icsk->icsk_probes_out++;
+ 		inet_csk_reset_xmit_timer(sk, ICSK_TIME_PROBE0,
+-					  min(icsk->icsk_rto << icsk->icsk_backoff, TCP_RTO_MAX),
++					  min(icsk->icsk_rto << icsk->icsk_backoff, (__u32)TCP_RTO_MAX),
+ 					  TCP_RTO_MAX);
+ 	} else {
+ 		/* If packet was not sent due to local congestion,
+@@ -2628,7 +2690,7 @@
+ 			icsk->icsk_probes_out = 1;
+ 		inet_csk_reset_xmit_timer(sk, ICSK_TIME_PROBE0,
+ 					  min(icsk->icsk_rto << icsk->icsk_backoff,
+-					      TCP_RESOURCE_PROBE_INTERVAL),
++					      (__u32)TCP_RESOURCE_PROBE_INTERVAL),
+ 					  TCP_RTO_MAX);
+ 	}
+ }
+@@ -2639,3 +2701,7 @@
+ EXPORT_SYMBOL(tcp_simple_retransmit);
+ EXPORT_SYMBOL(tcp_sync_mss);
+ EXPORT_SYMBOL(tcp_mtup_init);
++
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++EXPORT_SYMBOL(sysctl_tcp_delack_min);
++#endif
+diff -Naur linux-2.6.28.10/net/ipv4/tcp_timer.c linux-2.6.28.10-hrttcp/net/ipv4/tcp_timer.c
+--- linux-2.6.28.10/net/ipv4/tcp_timer.c	2009-05-02 14:54:43.000000000 -0400
++++ linux-2.6.28.10-hrttcp/net/ipv4/tcp_timer.c	2009-09-17 10:44:18.000000000 -0400
+@@ -180,7 +180,14 @@
+ 		/* Try again later. */
+ 		icsk->icsk_ack.blocked = 1;
+ 		NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_DELAYEDACKLOCKED);
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++		if (!hrtimer_start(&icsk->icsk_delack_timer,
++				   ktime_add_us(ktime_get(), sysctl_tcp_delack_min),
++				   HRTIMER_MODE_ABS))
++			sock_hold(sk);
++#else
+ 		sk_reset_timer(sk, &icsk->icsk_delack_timer, jiffies + TCP_DELACK_MIN);
++#endif
+ 		goto out_unlock;
+ 	}
+ 
+@@ -189,8 +196,16 @@
+ 	if (sk->sk_state == TCP_CLOSE || !(icsk->icsk_ack.pending & ICSK_ACK_TIMER))
+ 		goto out;
+ 
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++	if (ktime_us_delta(icsk->icsk_ack.timeout, ktime_get()) > 0) {
++		if (!hrtimer_start(&icsk->icsk_delack_timer,
++				   icsk->icsk_ack.timeout,
++				   HRTIMER_MODE_ABS))
++			sock_hold(sk);
++#else
+ 	if (time_after(icsk->icsk_ack.timeout, jiffies)) {
+ 		sk_reset_timer(sk, &icsk->icsk_delack_timer, icsk->icsk_ack.timeout);
++#endif
+ 		goto out;
+ 	}
+ 	icsk->icsk_ack.pending &= ~ICSK_ACK_TIMER;
+@@ -209,7 +224,14 @@
+ 	if (inet_csk_ack_scheduled(sk)) {
+ 		if (!icsk->icsk_ack.pingpong) {
+ 			/* Delayed ACK missed: inflate ATO. */
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++			icsk->icsk_ack.ato =
++				ns_to_ktime(NSEC_PER_USEC*
++					    min((u32)ktime_to_us(icsk->icsk_ack.ato) << 1,
++						(u32)jiffies_to_usecs(icsk->icsk_rto)));
++#else
+ 			icsk->icsk_ack.ato = min(icsk->icsk_ack.ato << 1, icsk->icsk_rto);
++#endif
+ 		} else {
+ 			/* Delayed ACK missed: leave pingpong mode and
+ 			 * deflate ATO.
+@@ -362,7 +384,7 @@
+ 		if (!icsk->icsk_retransmits)
+ 			icsk->icsk_retransmits = 1;
+ 		inet_csk_reset_xmit_timer(sk, ICSK_TIME_RETRANS,
+-					  min(icsk->icsk_rto, TCP_RESOURCE_PROBE_INTERVAL),
++					  min(icsk->icsk_rto, (__u32)TCP_RESOURCE_PROBE_INTERVAL),
+ 					  TCP_RTO_MAX);
+ 		goto out;
+ 	}
+@@ -386,7 +408,7 @@
+ 	icsk->icsk_retransmits++;
+ 
+ out_reset_timer:
+-	icsk->icsk_rto = min(icsk->icsk_rto << 1, TCP_RTO_MAX);
++	icsk->icsk_rto = min(icsk->icsk_rto << 1, (__u32)TCP_RTO_MAX);
+ 	inet_csk_reset_xmit_timer(sk, ICSK_TIME_RETRANS, icsk->icsk_rto, TCP_RTO_MAX);
+ 	if (icsk->icsk_retransmits > sysctl_tcp_retries1)
+ 		__sk_dst_reset(sk);
+@@ -403,15 +425,30 @@
+ 	bh_lock_sock(sk);
+ 	if (sock_owned_by_user(sk)) {
+ 		/* Try again later */
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++		if (!hrtimer_start(&icsk->icsk_retransmit_timer,
++				   ktime_add_us(ktime_get(), sysctl_tcp_rto_min),
++				   HRTIMER_MODE_ABS))
++			sock_hold(sk);		
++#else
+ 		sk_reset_timer(sk, &icsk->icsk_retransmit_timer, jiffies + (HZ / 20));
++#endif
+ 		goto out_unlock;
+ 	}
+ 
+ 	if (sk->sk_state == TCP_CLOSE || !icsk->icsk_pending)
+ 		goto out;
+ 
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++	if (ktime_us_delta(icsk->icsk_timeout, ktime_get()) > 0) {
++		if (!hrtimer_start(&icsk->icsk_retransmit_timer,
++				   icsk->icsk_timeout,
++				   HRTIMER_MODE_ABS))
++			sock_hold(sk);
++#else
+ 	if (time_after(icsk->icsk_timeout, jiffies)) {
+ 		sk_reset_timer(sk, &icsk->icsk_retransmit_timer, icsk->icsk_timeout);
++#endif
+ 		goto out;
+ 	}
+ 
+@@ -499,8 +536,11 @@
+ 	if (tp->packets_out || tcp_send_head(sk))
+ 		goto resched;
+ 
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++	elapsed = usecs_to_jiffies(tcp_time_stamp - tp->rcv_tstamp);
++#else
+ 	elapsed = tcp_time_stamp - tp->rcv_tstamp;
+-
++#endif
+ 	if (elapsed >= keepalive_time_when(tp)) {
+ 		if ((!tp->keepalive_probes && icsk->icsk_probes_out >= sysctl_tcp_keepalive_probes) ||
+ 		     (tp->keepalive_probes && icsk->icsk_probes_out >= tp->keepalive_probes)) {
+@@ -515,7 +555,11 @@
+ 			/* If keepalive was lost due to local congestion,
+ 			 * try harder.
+ 			 */
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++			elapsed = usecs_to_jiffies(tcp_time_stamp - tp->rcv_tstamp);
++#else
+ 			elapsed = TCP_RESOURCE_PROBE_INTERVAL;
++#endif
+ 		}
+ 	} else {
+ 		/* It is tp->rcv_tstamp + keepalive_time_when(tp) */
+diff -Naur linux-2.6.28.10/net/ipv6/tcp_ipv6.c linux-2.6.28.10-hrttcp/net/ipv6/tcp_ipv6.c
+--- linux-2.6.28.10/net/ipv6/tcp_ipv6.c	2009-05-02 14:54:43.000000000 -0400
++++ linux-2.6.28.10-hrttcp/net/ipv6/tcp_ipv6.c	2009-09-17 10:44:18.000000000 -0400
+@@ -1898,10 +1898,18 @@
+ 
+ 	if (icsk->icsk_pending == ICSK_TIME_RETRANS) {
+ 		timer_active	= 1;
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++		timer_expires	= usecs_to_jiffies(ktime_to_ns(icsk->icsk_timeout)*NSEC_PER_USEC);
++#else
+ 		timer_expires	= icsk->icsk_timeout;
++#endif
+ 	} else if (icsk->icsk_pending == ICSK_TIME_PROBE0) {
+ 		timer_active	= 4;
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++		timer_expires	= usecs_to_jiffies(ktime_to_ns(icsk->icsk_timeout)*NSEC_PER_USEC);
++#else
+ 		timer_expires	= icsk->icsk_timeout;
++#endif
+ 	} else if (timer_pending(&sp->sk_timer)) {
+ 		timer_active	= 2;
+ 		timer_expires	= sp->sk_timer.expires;
+@@ -1929,7 +1937,11 @@
+ 		   sock_i_ino(sp),
+ 		   atomic_read(&sp->sk_refcnt), sp,
+ 		   jiffies_to_clock_t(icsk->icsk_rto),
++#ifdef CONFIG_TCP_HIGH_RES_TIMERS
++		   (clock_t)div_u64((u64)ktime_to_ns(icsk->icsk_ack.ato), NSEC_PER_SEC / USER_HZ),
++#else
+ 		   jiffies_to_clock_t(icsk->icsk_ack.ato),
++#endif
+ 		   (icsk->icsk_ack.quick << 1 ) | icsk->icsk_ack.pingpong,
+ 		   tp->snd_cwnd, tp->snd_ssthresh>=0xFFFF?-1:tp->snd_ssthresh
+ 		   );
