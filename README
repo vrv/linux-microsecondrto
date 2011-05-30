@@ -20,10 +20,12 @@ patch.
 This patch has only been tested in local clusters and on a few
 externally facing machines, but needs much larger-scale testing before
 further adoption.  This repository contains two versions of the patch,
-one for Linux 2.6.28.10 and one for 2.6.39.  The 2.6.28.10 patch has
-been tested in real-world clusters, whereas the 2.6.39 patch compiles
-but has not been tested and may contain bugs (maintaining a separate
-patch across 2 years of independent kernel development is tough!)
+one for Linux 2.6.28.10 and one for 2.6.39 (cloned just hours before
+3.0-rc1 was released, so it should work on 3.0-rc1 too). The 2.6.28.10
+patch has been tested in real-world clusters, whereas the 2.6.39
+patch compiles but has not been tested and may contain bugs
+(maintaining a separate patch across 2 years of independent kernel
+development is tough!).
 
 This patch requires that the kernel config options HIGH_RES_TIMERS and
 TCP_HIGH_RES_TIMERS are enabled.
@@ -43,18 +45,18 @@ sysctl -w net.ipv4.tcp_delayed_ack=0
 
 Notes:
 
-1) This patch has not been tested, nor does it compile, with
-   TCP congestion control options such as cubic, bicubic, lp, etc.
+1) These patches have not been tested, nor do they compile, with TCP
+   congestion control options such as cubic, bicubic, lp, etc.
    Modifying these congestion control implementations should be
    somewhat straightforward if based off the changes from the default
    implementation.  Volunteers to implement/test are encouraged.
 
-2) An alternative to this patch is to simply reduce TCP_RTO_MIN in
+2) An alternative to these patches is to simply reduce TCP_RTO_MIN in
    tcp.h to 1.  However, this provides no less than 5ms
    retransmissions because the existing timer infrastructure is tied
    to HZ, which does not increase above 1000 in most configurations.
    However, this is a simple one-line change.  Note that this may have
-   strange interactions with delayed ACK unless you use the patch
+   strange interactions with delayed ACK unless you use a patch
    above to disable delayed ACK.  See
    http://www.pdl.cmu.edu/PDL-FTP/Storage/sigcomm147-vasudevan.pdf for
    details.
