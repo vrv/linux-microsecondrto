@@ -1,10 +1,10 @@
 Linux TCP microsecond timers patch
 Author: Vijay Vasudevan <vrv@cs.cmu.edu>
 
-This patch enables high-resolution TCP retransmissions.  It replaces
-the existing coarse-grained timers (using the jiffy timer) with
-microsecond-graunlarity timers using the high-resolution timer
-infrastructure.
+This patch adds support for microsecond-granularity TCP
+retransmissions.  It replaces the existing coarse-grained timers
+using the jiffy timer with microsecond-graunlarity timers using the
+high-resolution timer (hrtimer) infrastructure.
 
 Background: This patch was developed to help mitigate the "incast"
 problem for wide-fan-in, synchronized communication in datacenters.
