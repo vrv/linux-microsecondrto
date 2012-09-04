@@ -6,6 +6,11 @@ retransmissions.  It replaces the existing coarse-grained timers
 using the jiffy timer with microsecond-graunlarity timers using the
 high-resolution timer (hrtimer) infrastructure.
 
+Warning: This patch can cause the system to hang during heavy network
+activity for versions after 2.6.28.  I have not root caused the reason,
+so proceed with caution.  If you identify the problem, please let me know
+or submit a pull request to this patch.
+
 Background: This patch was developed to help mitigate the "incast"
 problem for wide-fan-in, synchronized communication in datacenters.
 See http://www.pdl.cmu.edu/Incast/ for details.  Our solution required
